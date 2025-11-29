@@ -1,0 +1,76 @@
+USE classicmodels;
+-- 1. Who are the top 5 sales representatives based on revenue generated?
+SELECT 
+	e.firstName, 
+    e.lastName, 
+    SUM(od.quantityOrdered * od.priceEach) AS totalRevenue
+FROM Employees e
+JOIN Customers c ON e.employeeNumber = c.salesRepEmployeeNumber -- Unión nueva necesaria
+JOIN Orders o ON c.customerNumber = o.customerNumber
+JOIN orderdetails od ON o.orderNumber = od.orderNumber
+GROUP BY e.employeeNumber, e.firstName, e.lastName
+ORDER BY totalRevenue DESC
+LIMIT 5;
+
+-- 2. Which product line generates the most revenue?
+USE classicmodels;
+SELECT pl.productLine,
+	SUM(od.quantityOrdered*od.priceEach) AS totalRevenue
+FROM productlines pl
+JOIN products p ON pl.productLine = p.productLine
+JOIN orderdetails od ON p.productCode = od.productCode
+GROUP BY pl.productLine
+ORDER BY totalRevenue DESC
+LIMIT 1;
+
+-- 3. Are there products that have never been sold?
+SELECT 
+    p.productName, 
+    p.productCode
+FROM products p
+LEFT JOIN orderdetails od ON p.productCode = od.productCode
+WHERE od.orderNumber IS NULL;
+
+-- Or we can use this other option
+SELECT productName,
+	productCode
+FROM products 
+WHERE productCode NOT IN (SELECT DISTINCT productCode FROM orderdetails);
+
+-- 4. How many orders were placed per month in the last year?
+SELECT 
+	DISTINCT(Year(orderDate))
+FROM orders;   -- To know the years included in this DB and select the last one
+
+SELECT
+	COUNT(orderNumber) AS QTY
+FROM orders
+Where YEAR(orderDate)=2005;  -- To know the exact amount of orders in 2005
+
+SELECT 
+    DATE_FORMAT(orderDate, '%Y-%m') AS mth_yr,
+    COUNT(orderNumber) AS ord_qty
+FROM Orders
+WHERE YEAR(orderDate) = 2005
+GROUP BY mth_yr
+ORDER BY mth_yr;  -- to know all the orders placed in the months of 2005
+
+-- 5. What are the most frequently ordered products?
+
+SELECT
+	p.productName,
+    COUNT(od.quantityOrdered) AS total_units_sold  -- If you want to know which product has been ordered the most (not quantity but orders placed with this product use COUNT instead of SUM)
+FROM products p
+JOIN orderdetails od ON p.productCode = od.productCode
+GROUP BY p.productCode, p.productName
+ORDER BY total_units_sold DESC
+LIMIT 10;
+
+SELECT
+	p.productName,
+    COUNT(od.quantityOrdered) AS total_orders  -- If you want to know which product has been ordered the most (not quantity but orders placed with this product use COUNT instead of SUM)
+FROM products p
+JOIN orderdetails od ON p.productCode = od.productCode
+GROUP BY p.productCode, p.productName
+ORDER BY total_orders DESC
+LIMIT 10;
