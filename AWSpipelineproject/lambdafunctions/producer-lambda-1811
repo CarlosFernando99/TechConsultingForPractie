@@ -1,0 +1,176 @@
+"""
+Author: Carlos Fernando Arriola Gutierrez
+Date: January 2026
+Region: ap-south-1 (Mumbai)
+"""
+
+# ============================================================================
+# LAMBDA 1: PRODUCER LAMBDA - API to Kinesis
+# ============================================================================
+# Purpose: Fetch data from JSONPlaceholder API and send to Kinesis stream
+# Trigger: EventBridge (scheduled every 6 hours)
+# Timeout: 60 seconds
+# Memory: 256 MB
+
+import json
+import boto3
+import requests
+from datetime import datetime
+import logging
+
+# Initialize AWS clients
+kinesis_client = boto3.client('kinesis', region_name='ap-south-1')
+sqs_client = boto3.client('sqs', region_name='ap-south-1')
+cloudwatch = boto3.client('cloudwatch', region_name='ap-south-1')
+dlq_url = "https://sqs.ap-south-1.amazonaws.com/430006376054/data-pipeline-dlq"
+
+# Configure logging
+logger = logging.getLogger()
+logger.setLevel(logging.INFO)
+
+def lambda_handler(event, context):   #changed def lambda_handler_producer to def lambda_handler
+    """
+    Producer Lambda: Fetches data from API and sends to Kinesis
+    
+    Flow:
+    1. Fetch data from JSONPlaceholder API (/users endpoint)
+    2. Validate JSON structure
+    3. Send each record to Kinesis stream
+    4. Handle errors and send to DLQ
+    5. Log metrics to CloudWatch
+    
+    Args:
+        event: EventBridge scheduled event
+        context: Lambda context object
+    
+    Returns:
+        dict: Status and metrics
+    """
+    
+    try:
+        # Step 1: Define API endpoint and Kinesis stream
+        api_url = "https://jsonplaceholder.typicode.com/users"
+        kinesis_stream_name = "data-ingestion-stream"
+        # dlq_url = "https://sqs.ap-south-1.amazonaws.com/430006376054/data-pipeline-dlq" #defined outside try to avoid errors
+        
+        logger.info(f"Starting Producer Lambda at {datetime.now()}")
+        
+        # Step 2: Fetch data from API
+        logger.info(f"Fetching data from API: {api_url}")
+        response = requests.get(api_url, timeout=10)
+        response.raise_for_status()  # Raise exception for bad status codes
+        
+        # Step 3: Parse JSON response
+        users_data = response.json()
+        logger.info(f"Successfully fetched {len(users_data)} records from API")
+        
+        # Step 4: Validate data structure
+        if not isinstance(users_data, list):
+            raise ValueError("API response is not a list")
+        
+        if len(users_data) == 0:
+            raise ValueError("API returned empty list")
+        
+        # Step 5: Send each record to Kinesis
+        successful_records = 0
+        failed_records = 0
+        
+        for idx, user in enumerate(users_data):
+            try:
+                # Add metadata to each record
+                record_with_metadata = {
+                    "data": user,
+                    "ingestion_timestamp": datetime.now().isoformat(),
+                    "source": "jsonplaceholder_api",
+                    "record_number": idx + 1,
+                    "total_records": len(users_data)
+                }
+                
+                # Convert to JSON string for Kinesis
+                record_json = json.dumps(record_with_metadata)
+                
+                # Send to Kinesis stream
+                # Partition key: use user ID to ensure same user goes to same shard
+                kinesis_response = kinesis_client.put_record(
+                    StreamName=kinesis_stream_name,
+                    Data=record_json,
+                    PartitionKey=str(user['id'])  # Ensures ordering per user
+                )
+                
+                logger.info(f"Record {idx + 1} sent to Kinesis. Shard ID: {kinesis_response['ShardId']}")
+                successful_records += 1
+                
+            except Exception as e:
+                # Step 6: Handle individual record failures
+                logger.error(f"Failed to send record {idx + 1}: {str(e)}")
+                failed_records += 1
+                
+                # Send error details to DLQ
+                try:
+                    sqs_client.send_message(
+                        QueueUrl=dlq_url,
+                        MessageBody=json.dumps({
+                            "error": str(e),
+                            "record_index": idx,
+                            "user_id": user.get('id'),
+                            "timestamp": datetime.now().isoformat()
+                        })
+                    )
+                except Exception as dlq_error:
+                    logger.error(f"Failed to send to DLQ: {str(dlq_error)}")
+        
+        # Step 7: Log metrics to CloudWatch
+        cloudwatch.put_metric_data(
+            Namespace='DataPipeline',
+            MetricData=[
+                {
+                    'MetricName': 'ProducerSuccessfulRecords',
+                    'Value': successful_records,
+                    'Unit': 'Count'
+                },
+                {
+                    'MetricName': 'ProducerFailedRecords',
+                    'Value': failed_records,
+                    'Unit': 'Count'
+                }
+            ]
+        )
+        
+        # Step 8: Return success response
+        logger.info(f"Producer Lambda completed. Success: {successful_records}, Failed: {failed_records}")
+        
+        return {
+            'statusCode': 200,
+            'body': json.dumps({
+                'message': 'Data successfully sent to Kinesis',
+                'successful_records': successful_records,
+                'failed_records': failed_records,
+                'total_records': len(users_data),
+                'timestamp': datetime.now().isoformat()
+            })
+        }
+        
+    except Exception as e:
+        # Step 9: Handle critical errors
+        logger.error(f"Critical error in Producer Lambda: {str(e)}")
+        
+        # Send error to DLQ
+        try:
+            sqs_client.send_message(
+                QueueUrl=dlq_url,
+                MessageBody=json.dumps({
+                    "error": str(e),
+                    "error_type": "CRITICAL_PRODUCER_ERROR",
+                    "timestamp": datetime.now().isoformat()
+                })
+            )
+        except:
+            pass
+        
+        return {
+            'statusCode': 500,
+            'body': json.dumps({
+                'error': str(e),
+                'timestamp': datetime.now().isoformat()
+            })
+        }
