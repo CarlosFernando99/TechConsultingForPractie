@@ -1,0 +1,218 @@
+"""
+AWS Data Pipeline - Lambda Functions
+Author: Carlos Fernando Arriola
+Date: January 2026
+Region: ap-south-1 (Mumbai)
+"""
+
+
+# ============================================================================
+# LAMBDA 3: DATA QUALITY CHECK LAMBDA
+# ============================================================================
+# Purpose: Validate data quality in Bronze layer
+# Trigger: Step Functions (after Glue Crawler)
+# Timeout: 60 seconds
+# Memory: 256 MB
+
+
+import json
+import boto3
+import logging
+from datetime import datetime
+
+# AWS clients/resources
+s3 = boto3.client("s3", region_name="ap-south-1")
+glue = boto3.client("glue", region_name="ap-south-1")
+dynamodb = boto3.resource("dynamodb", region_name="ap-south-1")
+
+logger = logging.getLogger()
+logger.setLevel(logging.INFO)
+
+def _is_null(v):
+    return v is None or (isinstance(v, str) and v.strip() == "")
+
+def lambda_handler_quality_check(event, context):
+    """
+    Validates Bronze layer data quality by:
+    - Pulling expected schema from Glue Catalog
+    - Reading the Bronze JSONL file from S3
+    - Running checks: schema presence, nulls, basic type checks, duplicates (by user id)
+    - Writing results to DynamoDB and returning a summary
+    """
+
+    try:
+        # -----------------------------
+        # 1) Read inputs from Step Functions
+        # -----------------------------
+        load_id = event.get("load_id", "unknown")
+        s3_bucket = event.get("s3_bucket", "bdtraining1811")
+        s3_key = event.get("s3_key")  # REQUIRED for real checks
+
+        database_name = event.get("glue_database", "bronze_database")
+        table_name = event.get("glue_table", "users")
+
+        if not s3_key:
+            return {
+                "statusCode": 400,
+                "error": "Missing required input: s3_key (Bronze file path)",
+                "timestamp": datetime.now().isoformat()
+            }
+
+        logger.info(f"Quality Check start | load_id={load_id} | s3://{s3_bucket}/{s3_key}")
+
+        # -----------------------------
+        # 2) Get expected schema from Glue
+        # -----------------------------
+        table_response = glue.get_table(DatabaseName=database_name, Name=table_name)
+        columns = table_response["Table"]["StorageDescriptor"]["Columns"]
+
+        # We expect JSON like: {"data": {...}, "ingestion_timestamp": "...", ...}
+        # Glue schema might describe top-level columns depending on crawler.
+        expected_cols = [c["Name"] for c in columns]
+        logger.info(f"Glue table columns: {expected_cols}")
+
+        # -----------------------------
+        # 3) Load Bronze file from S3 (JSON Lines)
+        # -----------------------------
+        obj = s3.get_object(Bucket=s3_bucket, Key=s3_key)
+        body = obj["Body"].read().decode("utf-8")
+
+        # Each line is one JSON record
+        lines = [ln for ln in body.splitlines() if ln.strip()]
+        records = [json.loads(ln) for ln in lines]
+
+        record_count = len(records)
+        logger.info(f"Loaded {record_count} records from Bronze file")
+
+        # -----------------------------
+        # 4) Run quality checks
+        # -----------------------------
+        results = {
+            "record_count": record_count,
+            "schema_validation": True,
+            "missing_columns": [],
+            "null_checks": True,
+            "null_issues": {},
+            "data_type_validation": True,
+            "type_issues": [],
+            "duplicate_detection": True,
+            "duplicate_count": 0,
+            "quality_score": 1.0
+        }
+
+        # 4a) Schema validation (top-level)
+        # Check that expected columns exist in the data (for at least 1 record)
+        if record_count > 0:
+            sample_keys = set(records[0].keys())
+            missing = [c for c in expected_cols if c not in sample_keys]
+            if missing:
+                results["schema_validation"] = False
+                results["missing_columns"] = missing
+
+        # 4b) Null checks for key fields (customize as needed)
+        # We'll check "data.id", "data.name", "data.email" if present
+        null_fields = {"data.id": 0, "data.name": 0, "data.email": 0}
+
+        # 4c) Duplicate detection based on user id
+        seen_ids = set()
+        dup_count = 0
+
+        for r in records:
+            data = r.get("data", {})
+
+            # Null checks
+            if _is_null(data.get("id")):
+                null_fields["data.id"] += 1
+            if _is_null(data.get("name")):
+                null_fields["data.name"] += 1
+            if _is_null(data.get("email")):
+                null_fields["data.email"] += 1
+
+            # Type checks (basic)
+            if "id" in data and data["id"] is not None and not isinstance(data["id"], int):
+                results["data_type_validation"] = False
+                results["type_issues"].append({"field": "data.id", "value": data["id"], "expected": "int"})
+
+            # Duplicates
+            uid = data.get("id")
+            if uid is not None:
+                if uid in seen_ids:
+                    dup_count += 1
+                else:
+                    seen_ids.add(uid)
+
+        # Null checks evaluation
+        results["null_issues"] = null_fields
+        if any(v > 0 for v in null_fields.values()):
+            results["null_checks"] = False
+
+        # Duplicate evaluation
+        results["duplicate_count"] = dup_count
+        if dup_count > 0:
+            results["duplicate_detection"] = False
+
+        # -----------------------------
+        # 5) Compute a real quality score (simple, explainable)
+        # -----------------------------
+        # Start at 1.0 and subtract penalties
+        score = 1.0
+
+        # Penalize schema missing columns
+        if not results["schema_validation"]:
+            score -= min(0.20, 0.05 * len(results["missing_columns"]))
+
+        # Penalize null rates (up to 0.30)
+        if record_count > 0:
+            total_nulls = sum(null_fields.values())
+            null_rate = total_nulls / (record_count * len(null_fields))
+            score -= min(0.30, null_rate)
+
+        # Penalize duplicates (up to 0.30)
+        if record_count > 0:
+            dup_rate = dup_count / record_count
+            score -= min(0.30, dup_rate)
+
+        # Penalize type issues (up to 0.20)
+        if results["type_issues"]:
+            score -= min(0.20, 0.02 * len(results["type_issues"]))
+
+        score = max(0.0, round(score, 4))
+        results["quality_score"] = score
+
+        logger.info(f"Quality results: score={score} | nulls={null_fields} | dups={dup_count}")
+
+        # -----------------------------
+        # 6) Update DynamoDB
+        # -----------------------------
+        table = dynamodb.Table("incremental_load_tracking")
+
+        table.update_item(
+            Key={"load_id": load_id},
+            UpdateExpression="SET quality_checks=:qc, quality_score=:qs, quality_checked_at=:t",
+            ExpressionAttributeValues={
+                ":qc": json.dumps(results),
+                ":qs": score,
+                ":t": datetime.now().isoformat()
+            }
+        )
+
+        # -----------------------------
+        # 7) Return results
+        # -----------------------------
+        return {
+            "statusCode": 200,
+            "load_id": load_id,
+            "s3_bucket": s3_bucket,
+            "s3_key": s3_key,
+            "quality_score": score,
+            "quality_checks": results,
+            "timestamp": datetime.now().isoformat()
+        }
+
+    except Exception as e:
+        logger.error(f"Error in Data Quality Check Lambda: {str(e)}")
+        return {
+            "statusCode": 500,
+            "error": str(e),
+            "timestamp": datetime.now().isoformat()
+        }
