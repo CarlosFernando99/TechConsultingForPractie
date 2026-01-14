@@ -1,0 +1,283 @@
+"""
+AWS Data Pipeline - Glue Jobs
+Complete PySpark code for Glue ETL jobs in the medallion architecture
+
+Author: Carlos F Gutierrez
+Date: January 2026
+Region: ap-south-1 (Mumbai)
+"""
+
+# ============================================================================
+# GLUE JOB A: BRONZE TO SILVER TRANSFORMATION
+# ============================================================================
+# Purpose: Clean, validate, and transform data from Bronze to Silver layer
+# Input: S3 Bronze layer (JSON)
+# Output: S3 Silver layer (Parquet)
+# Trigger: Step Functions (after Glue Crawler)
+# Timeout: 15 minutes
+# Workers: 2 G.2X workers
+# ============================================================================
+
+import sys
+import json
+from datetime import datetime
+
+from awsglue.transforms import *
+from awsglue.utils import getResolvedOptions
+from pyspark.context import SparkContext
+from awsglue.context import GlueContext
+from awsglue.job import Job
+from awsglue.dynamicframe import DynamicFrame
+
+from pyspark.sql.window import Window
+from pyspark.sql.functions import (
+    col, when, coalesce, trim, lower,
+    current_timestamp, row_number,
+    isnan, isnull,
+    length, lit, to_date
+)
+
+# ----------------------------------------------------------------------------
+# Step 1: Initialize Glue context and Spark session
+# ----------------------------------------------------------------------------
+args = getResolvedOptions(sys.argv, ['JOB_NAME', 'TempDir'])
+sc = SparkContext()
+glueContext = GlueContext(sc)
+spark = glueContext.spark_session
+job = Job(glueContext)
+job.init(args['JOB_NAME'], args)
+
+# ----------------------------------------------------------------------------
+# Step 2: Configure logging
+# ----------------------------------------------------------------------------
+logger = glueContext.get_logger()
+logger.info("Starting Glue Job A: Bronze to Silver Transformation")
+
+def glue_job_bronze_to_silver():
+    """
+    Glue Job A: Transforms Bronze layer data to Silver layer
+
+    Transformations:
+    1. Read Bronze layer from Glue Catalog (JSON)
+    2. Flatten nested JSON structures (supports both top-level and `data.*` formats)
+    3. Data quality checks:
+       - Remove records missing critical fields
+       - Validate email format
+       - Validate phone format
+       - Remove duplicates
+    4. Standardize fields (lower/trim)
+    5. Add metadata columns + quality_flag
+    6. Write to Silver layer (Parquet), partitioned by processing_date (YYYY-MM-DD)
+
+    Returns:
+        dict: Job execution metrics
+    """
+    try:
+        # --------------------------------------------------------------------
+        # Step 3: Define S3 paths
+        # --------------------------------------------------------------------
+        bronze_path = "s3://bdtraining1811/bronze/"
+        silver_path = "s3://bdtraining1811/silver/"
+
+        logger.info(f"Reading Bronze layer from: {bronze_path}")
+
+        # --------------------------------------------------------------------
+        # Step 4: Read Bronze layer using Glue Catalog
+        # --------------------------------------------------------------------
+        bronze_dyf = glueContext.create_dynamic_frame.from_catalog(
+            database="bronze_database",
+            table_name="usersbronze",
+            transformation_ctx="bronze_dyf"
+        )
+
+        logger.info(f"Bronze DynamicFrame created with {bronze_dyf.count()} records")
+
+        # --------------------------------------------------------------------
+        # Step 5: Convert DynamicFrame to Spark DataFrame
+        # --------------------------------------------------------------------
+        bronze_df = bronze_dyf.toDF()
+        logger.info("Converted DynamicFrame to Spark DataFrame")
+
+        # --------------------------------------------------------------------
+        # Step 6: Flatten nested JSON structures
+        # Supports BOTH shapes:
+        #   A) Top-level fields: id, name, address.city, company.name, ...
+        #   B) Wrapped fields: data.id, data.name, data.address.city, data.company.name, ...
+        # --------------------------------------------------------------------
+        flattened_df = bronze_df.select(
+            # User basic info
+            coalesce(col("data.id"), col("id")).cast("integer").alias("user_id"),
+            coalesce(col("data.name"), col("name")).alias("user_name"),
+            coalesce(col("data.username"), col("username")).alias("username"),
+            coalesce(col("data.email"), col("email")).alias("email"),
+            coalesce(col("data.phone"), col("phone")).alias("phone"),
+            coalesce(col("data.website"), col("website")).alias("website"),
+
+            # Address fields
+            coalesce(col("data.address.street"), col("address.street")).alias("street"),
+            coalesce(col("data.address.suite"), col("address.suite")).alias("suite"),
+            coalesce(col("data.address.city"), col("address.city")).alias("city"),
+            coalesce(col("data.address.zipcode"), col("address.zipcode")).alias("zipcode"),
+            coalesce(col("data.address.geo.lat"), col("address.geo.lat")).cast("double").alias("latitude"),
+            coalesce(col("data.address.geo.lng"), col("address.geo.lng")).cast("double").alias("longitude"),
+
+            # Company fields
+            coalesce(col("data.company.name"), col("company.name")).alias("company_name"),
+            coalesce(col("data.company.catchPhrase"), col("company.catchPhrase")).alias("company_catchphrase"),
+            coalesce(col("data.company.bs"), col("company.bs")).alias("company_bs"),
+
+            # Metadata columns (support either location)
+            coalesce(col("data.ingestion_timestamp"), col("ingestion_timestamp")).alias("ingestion_timestamp"),
+            coalesce(col("data.s3_ingestion_timestamp"), col("s3_ingestion_timestamp")).alias("s3_ingestion_timestamp")
+        )
+
+        logger.info("Flattened nested JSON structures (supports data.* or top-level)")
+
+        # --------------------------------------------------------------------
+        # Step 7: Data cleaning - remove null records (critical fields)
+        # --------------------------------------------------------------------
+        cleaned_df = flattened_df.filter(
+            (col("user_id").isNotNull()) &
+            (col("user_name").isNotNull()) &
+            (col("email").isNotNull())
+        )
+
+        logger.info(f"After null removal: {cleaned_df.count()} records")
+
+        # --------------------------------------------------------------------
+        # Step 8: Data validation - email format check (simple)
+        # --------------------------------------------------------------------
+        email_validated_df = cleaned_df.withColumn(
+            "email_valid",
+            when(
+                (col("email").contains("@")) & (col("email").contains(".")),
+                True
+            ).otherwise(False)
+        )
+
+        logger.info("Added email validation column")
+
+        # --------------------------------------------------------------------
+        # Step 9: Data validation - phone format check (simple)
+        # --------------------------------------------------------------------
+        phone_validated_df = email_validated_df.withColumn(
+            "phone_valid",
+            when(
+                (col("phone").isNotNull()) & (length(col("phone")) >= 10),
+                True
+            ).otherwise(False)
+        )
+
+        logger.info("Added phone validation column")
+
+        # --------------------------------------------------------------------
+        # Step 10: Remove duplicates (by email)
+        # --------------------------------------------------------------------
+        window_spec = Window.partitionBy("email").orderBy("user_id")
+
+        deduplicated_df = phone_validated_df.withColumn(
+            "row_num",
+            row_number().over(window_spec)
+        ).filter(col("row_num") == 1).drop("row_num")
+
+        logger.info(f"After deduplication: {deduplicated_df.count()} records")
+
+        # --------------------------------------------------------------------
+        # Step 11: Standardize string fields
+        # --------------------------------------------------------------------
+        standardized_df = deduplicated_df.select(
+            col("user_id"),
+            trim(lower(col("user_name"))).alias("user_name"),
+            trim(lower(col("username"))).alias("username"),
+            trim(lower(col("email"))).alias("email"),
+            trim(col("phone")).alias("phone"),
+            trim(lower(col("website"))).alias("website"),
+            trim(col("street")).alias("street"),
+            trim(col("suite")).alias("suite"),
+            trim(lower(col("city"))).alias("city"),
+            trim(col("zipcode")).alias("zipcode"),
+            col("latitude"),
+            col("longitude"),
+            trim(col("company_name")).alias("company_name"),
+            trim(col("company_catchphrase")).alias("company_catchphrase"),
+            trim(col("company_bs")).alias("company_bs"),
+            col("email_valid"),
+            col("phone_valid"),
+            col("ingestion_timestamp"),
+            col("s3_ingestion_timestamp")
+        )
+
+        logger.info("Applied data standardization")
+
+        # --------------------------------------------------------------------
+        # Step 12: Add quality flag and processing metadata
+        # Best partition method for Athena/Redshift: processing_date (YYYY-MM-DD)
+        # --------------------------------------------------------------------
+        quality_df = (
+            standardized_df
+            .withColumn(
+                "quality_flag",
+                when((col("email_valid") == True) & (col("phone_valid") == True), "PASS")
+                .otherwise("FAIL")
+            )
+            .withColumn("processing_timestamp", current_timestamp())
+            .withColumn("layer", lit("silver"))
+            .withColumn("processing_date", to_date(col("processing_timestamp")))
+        )
+
+        logger.info("Added quality flags and metadata columns")
+
+        # --------------------------------------------------------------------
+        # Step 13: Write to Silver layer (Parquet)
+        # Partition by processing_date for performance + easy incremental reads
+        # --------------------------------------------------------------------
+        silver_dyf = DynamicFrame.fromDF(quality_df, glueContext, "silver_dyf")
+
+        silver_count = quality_df.count()
+        logger.info(f"Writing {silver_count} records to Silver layer")
+
+        glueContext.write_dynamic_frame.from_options(
+            frame=silver_dyf,
+            connection_type="s3",
+            format="parquet",
+            connection_options={
+                "path": silver_path,
+                "partitionKeys": ["processing_date"]
+            },
+            transformation_ctx="silver_write"
+        )
+
+        logger.info(f"Successfully wrote to Silver layer: {silver_path}")
+
+        # --------------------------------------------------------------------
+        # Step 14: Log job metrics
+        # (Note: multiple counts trigger jobs; kept for clarity in tutorial)
+        # --------------------------------------------------------------------
+        total_records_bronze = bronze_df.count()
+        quality_pass = quality_df.filter(col("quality_flag") == "PASS").count()
+        quality_fail = quality_df.filter(col("quality_flag") == "FAIL").count()
+        total_records_silver = silver_count
+
+        metrics = {
+            "total_records_bronze": total_records_bronze,
+            "total_records_silver": total_records_silver,
+            "quality_pass": quality_pass,
+            "quality_fail": quality_fail,
+            "quality_score": (quality_pass / total_records_silver * 100) if total_records_silver > 0 else 0,
+            "timestamp": datetime.now().isoformat()
+        }
+
+        logger.info(f"Job Metrics: {json.dumps(metrics)}")
+        return metrics
+
+    except Exception as e:
+        logger.error(f"Error in Glue Job A: {str(e)}")
+        raise
+
+# ----------------------------------------------------------------------------
+# Run job
+# ----------------------------------------------------------------------------
+glue_job_bronze_to_silver()
+
+# Commit job
+job.commit()
