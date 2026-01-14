@@ -1,0 +1,121 @@
+"""
+Author: Carlos Fernando Arriola Gutierrez
+Date: January 2026
+Region: ap-south-1 (Mumbai)
+"""
+
+# ============================================================================
+# LAMBDA 5: REDSHIFT QUERY LAMBDA
+# ============================================================================
+# Purpose: Execute queries on Redshift for Power BI integration
+# Trigger: On-demand or scheduled
+# Timeout: 60 seconds
+# Memory: 256 MB
+
+import json
+import boto3
+import logging
+from datetime import datetime
+
+logger = logging.getLogger()
+logger.setLevel(logging.INFO)
+
+REGION = "ap-south-1"
+WORKGROUP_NAME = "default"   # <- update this
+DATABASE = "dev"
+SECRET_ARN_OR_NAME = "arn:aws:secretsmanager:ap-south-1:430006376054:secret:redshift-credentials-b5vIQj"  # can be ARN or name, depending on how you set it up
+
+rsd = boto3.client("redshift-data", region_name=REGION)
+
+QUERIES = {
+    "healthcheck": "SELECT 1 AS ok;",
+    "insight_1": """
+        SELECT DATE(load_timestamp) AS date, COUNT(*) AS record_count
+        FROM gold_users
+        GROUP BY 1
+        ORDER BY 1 DESC
+        LIMIT 30
+    """,
+    "insight_2": """
+        SELECT
+            (COUNT(CASE WHEN quality_flag='PASS' THEN 1 END) * 100.0 / NULLIF(COUNT(*),0)) AS quality_score
+        FROM silver_users
+    """,
+    "insight_3": """
+        SELECT company_name, COUNT(*) AS user_count
+        FROM gold_users
+        GROUP BY 1
+        ORDER BY 2 DESC
+        LIMIT 10
+    """,
+    "insight_4": """
+        SELECT city, COUNT(*) AS user_count
+        FROM gold_users
+        GROUP BY 1
+        ORDER BY 2 DESC
+        LIMIT 20
+    """,
+    "insight_5": """
+        SELECT layer, AVG(processing_time_seconds) AS avg_time
+        FROM processing_metrics
+        GROUP BY 1
+        ORDER BY 1
+    """
+}
+
+def lambda_handler_redshift_query(event, context):
+    try:
+        query_type = (event or {}).get("query_type", "healthcheck")
+        sql = QUERIES.get(query_type, QUERIES["healthcheck"])
+
+        logger.info(f"Executing Data API query | query_type={query_type}")
+
+        # 1) Execute statement
+        exec_resp = rsd.execute_statement(
+            WorkgroupName=WORKGROUP_NAME,
+            Database=DATABASE,
+            SecretArn=SECRET_ARN_OR_NAME,   # if this errors, you'll need the full Secret ARN
+            Sql=sql
+        )
+
+        statement_id = exec_resp["Id"]
+
+        # 2) Wait until finished (simple polling, Lambda-friendly for small queries)
+        status = "STARTED"
+        while status in ("STARTED", "SUBMITTED", "PICKED", "RUNNING"):
+            desc = rsd.describe_statement(Id=statement_id)
+            status = desc["Status"]
+            if status in ("FAILED", "ABORTED"):
+                raise Exception(desc.get("Error", f"Statement {status}"))
+
+        # 3) Fetch results
+        result = rsd.get_statement_result(Id=statement_id)
+
+        # Convert Data API format -> list[dict]
+        columns = [c["name"] for c in result["ColumnMetadata"]]
+        rows = []
+        for r in result["Records"]:
+            vals = []
+            for cell in r:
+                # cell is a dict with exactly one key (stringValue/longValue/doubleValue/booleanValue/isNull)
+                if "isNull" in cell and cell["isNull"]:
+                    vals.append(None)
+                else:
+                    vals.append(next(iter(cell.values())))
+            rows.append(dict(zip(columns, vals)))
+
+        return {
+            "statusCode": 200,
+            "query_type": query_type,
+            "row_count": len(rows),
+            "data": rows,
+            "timestamp": datetime.utcnow().isoformat() + "Z"
+        }
+
+    except Exception as e:
+        logger.error(f"Error in Redshift Query Lambda (Data API): {str(e)}")
+        return {
+            "statusCode": 500,
+            "error": str(e),
+            "timestamp": datetime.utcnow().isoformat() + "Z"
+        }
