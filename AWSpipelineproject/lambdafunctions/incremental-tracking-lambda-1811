@@ -1,0 +1,163 @@
+"""
+Author: Carlos Fernando Arriola Gutierrez
+Date: January 2026
+Region: ap-south-1 (Mumbai)
+"""
+
+# ============================================================================
+# LAMBDA 4: INCREMENTAL LOAD TRACKING LAMBDA
+# ============================================================================
+# Purpose: Track incremental loads using DynamoDB timestamps
+# Trigger: Step Functions (before Producer Lambda)
+# Timeout: 30 seconds
+# Memory: 128 MB
+#
+# DynamoDB table key schema (confirmed by schema probe):
+# - Partition key (HASH): load_id (String)
+# - Sort key (RANGE):     load_timestamp (String)
+#
+# Data model used in this Lambda:
+# - Pointer item (stores "last successful load" state):
+#     PK load_id        = "STATE"
+#     SK load_timestamp = "LAST_SUCCESS"
+#     Attributes:
+#       - last_successful_timestamp (ISO string)
+#       - last_successful_load_id   (string)
+#
+# - Run items (one record per pipeline run):
+#     PK load_id        = "LOAD"
+#     SK load_timestamp = "<current ISO timestamp>"
+#     Attributes:
+#       - run_id (string, human-friendly: load_<timestamp>)
+#       - status ("IN_PROGRESS" | "SUCCESS" | "FAILED")
+#       - load_type ("FULL" | "INCREMENTAL")
+#       - last_successful_timestamp, last_successful_load_id
+# ============================================================================
+
+import json
+import boto3
+import logging
+from datetime import datetime, timezone
+
+dynamodb = boto3.resource("dynamodb")  # uses Lambda region
+
+logger = logging.getLogger()
+logger.setLevel(logging.INFO)
+
+TABLE_NAME = "incremental_load_tracking"
+FULL_LOAD_THRESHOLD_SECONDS = 24 * 60 * 60  # 24 hours
+
+# Pointer item keys (must include BOTH PK + SK)
+POINTER_PK = "STATE"
+POINTER_SK = "LAST_SUCCESS"
+
+# Run items keys
+RUN_PK = "LOAD"  # all runs share the same partition key, sorted by timestamp
+
+def now_iso_utc() -> str:
+    """Return current UTC timestamp in ISO-8601 format."""
+    return datetime.now(timezone.utc).isoformat()
+
+def lambda_handler_incremental_tracking(event, context):
+    """
+    Incremental Load Tracking Lambda (PK+SK DynamoDB table)
+
+    What this function does:
+    - Acts as the pipeline "timekeeper" before ingestion starts.
+    - Reads the last SUCCESSFUL run timestamp from a single pointer item in DynamoDB.
+    - Decides whether the current run should be FULL or INCREMENTAL.
+    - Creates a new run record in DynamoDB with status IN_PROGRESS.
+    - Returns run parameters to Step Functions so downstream Lambdas (Producer, etc.)
+      can tag all work with the same run_id.
+
+    Flow:
+    1) (Debug) Run a schema probe (describe_table) to log the real KeySchema/ARN.
+    2) Read the pointer item: (load_id="STATE", load_timestamp="LAST_SUCCESS").
+    3) Compute time since last success and decide load_type (FULL vs INCREMENTAL).
+    4) Write a new run item: (load_id="LOAD", load_timestamp=<now>) with IN_PROGRESS.
+    5) Return run identifiers + timestamps to Step Functions.
+    """
+
+    table = dynamodb.Table(TABLE_NAME)
+
+    try:
+        logger.info("Starting Incremental Load Tracking Lambda")
+
+        # -----------------------------
+        # 1) Schema probe (debug)
+        # -----------------------------
+        ddb = boto3.client("dynamodb")
+        desc = ddb.describe_table(TableName=TABLE_NAME)
+        logger.info(f"DEBUG TableArn: {desc['Table']['TableArn']}")
+        logger.info(f"DEBUG KeySchema: {desc['Table']['KeySchema']}")
+        logger.info(f"DEBUG AttributeDefinitions: {desc['Table']['AttributeDefinitions']}")
+
+        # -----------------------------
+        # Current time
+        # -----------------------------
+        current_timestamp = now_iso_utc()
+        current_dt = datetime.fromisoformat(current_timestamp)
+
+        # -----------------------------
+        # 2) Read pointer item (PK+SK required)
+        # -----------------------------
+        pointer_resp = table.get_item(
+            Key={"load_id": POINTER_PK, "load_timestamp": POINTER_SK}
+        )
+        pointer_item = pointer_resp.get("Item")
+
+        last_successful_timestamp = None
+        last_successful_load_id = None
+
+        # -----------------------------
+        # 3) Decide load type
+        # -----------------------------
+        if pointer_item and pointer_item.get("last_successful_timestamp"):
+            last_successful_timestamp = pointer_item["last_successful_timestamp"]
+            last_successful_load_id = pointer_item.get("last_successful_load_id")
+
+            last_dt = datetime.fromisoformat(last_successful_timestamp)
+            delta_seconds = (current_dt - last_dt).total_seconds()
+
+            load_type = "INCREMENTAL" if delta_seconds < FULL_LOAD_THRESHOLD_SECONDS else "FULL"
+            logger.info(f"Last successful load was {int(delta_seconds)} seconds ago -> {load_type}")
+        else:
+            load_type = "FULL"
+            logger.info("No pointer found (or missing last_successful_timestamp) -> FULL load")
+
+        # -----------------------------
+        # 4) Create new run record (PK+SK required)
+        # -----------------------------
+        run_id = f"load_{current_timestamp}"
+
+        table.put_item(
+            Item={
+                "load_id": RUN_PK,                    # PK groups all runs together
+                "load_timestamp": current_timestamp,  # SK sorts runs by time
+                "run_id": run_id,
+                "status": "IN_PROGRESS",
+                "load_type": load_type,
+                "last_successful_timestamp": last_successful_timestamp,
+                "last_successful_load_id": last_successful_load_id,
+            }
+        )
+
+        logger.info(f"Created new run record: {run_id} (Type: {load_type})")
+
+        # -----------------------------
+        # 5) Return params for Step Functions / Producer
+        # -----------------------------
+        return {
+            "statusCode": 200,
+            "run_pk": RUN_PK,
+            "run_sk": current_timestamp,
+            "run_id": run_id,
+            "load_type": load_type,
+            "last_successful_timestamp": last_successful_timestamp,
+            "last_successful_load_id": last_successful_load_id,
+            "current_timestamp": current_timestamp,
+        }
+
+    except Exception as e:
+        logger.error(f"Error in Incremental Load Tracking Lambda: {str(e)}")
+        return {"statusCode": 500, "error": str(e), "timestamp": now_iso_utc()}
