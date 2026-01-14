@@ -1,0 +1,230 @@
+"""
+AWS Data Pipeline - Glue Job B: Silver to Gold Transformation
+Author: Carlos F Gutierrez
+Date: January 2026
+Region: ap-south-1 (Mumbai)
+"""
+
+import sys
+import json
+from datetime import datetime
+
+from awsglue.utils import getResolvedOptions
+from pyspark.context import SparkContext
+from awsglue.context import GlueContext
+from awsglue.job import Job
+from awsglue.dynamicframe import DynamicFrame
+
+from pyspark.sql.functions import (
+    col, when, current_timestamp, to_date,
+    count, countDistinct, avg, sum as spark_sum, lit
+)
+
+# ----------------------------------------------------------------------------
+# Glue / Spark bootstrap
+# ----------------------------------------------------------------------------
+args = getResolvedOptions(sys.argv, ["JOB_NAME", "TempDir"])
+sc = SparkContext()
+glueContext = GlueContext(sc)
+spark = glueContext.spark_session
+job = Job(glueContext)
+job.init(args["JOB_NAME"], args)
+
+logger = glueContext.get_logger()
+logger.info("Starting Glue Job B: Silver to Gold Transformation")
+
+def glue_job_silver_to_gold():
+    """
+    Reads Silver (Parquet via Glue Catalog), produces Gold datasets for analytics:
+
+    Outputs (S3):
+      - s3://bdtraining1811/gold/users/
+      - s3://bdtraining1811/gold/company_aggregation/
+      - s3://bdtraining1811/gold/geographic_aggregation/
+      - s3://bdtraining1811/gold/quality_metrics/
+
+    Partition strategy:
+      - users: partition by processing_date (carried from Silver)
+      - aggregations/metrics: partition by gold_load_date (today)
+    """
+    try:
+        gold_path = "s3://bdtraining1811/gold/"
+
+        # --------------------------------------------------------------------
+        # 1) Read Silver layer from Glue Catalog
+        # --------------------------------------------------------------------
+        silver_dyf = glueContext.create_dynamic_frame.from_catalog(
+            database="silver_database",
+            table_name="users",
+            transformation_ctx="silver_dyf"
+        )
+        silver_df = silver_dyf.toDF()
+        silver_count = silver_df.count()
+        logger.info(f"Silver DataFrame loaded: {silver_count} records")
+
+        # --------------------------------------------------------------------
+        # 2) Common timestamps
+        # --------------------------------------------------------------------
+        gold_load_ts_col = current_timestamp()
+        gold_load_date_col = to_date(gold_load_ts_col)
+
+        # --------------------------------------------------------------------
+        # 3) Gold Users table (denormalized user dimension/fact)
+        # Include processing_date from Silver (best for partitioning and lineage)
+        # --------------------------------------------------------------------
+        user_gold_df = (
+            silver_df.select(
+                col("user_id"),
+                col("user_name"),
+                col("username"),
+                col("email"),
+                col("phone"),
+                col("website"),
+                col("street"),
+                col("suite"),
+                col("city"),
+                col("zipcode"),
+                col("latitude"),
+                col("longitude"),
+                col("company_name"),
+                col("company_catchphrase"),
+                col("company_bs"),
+                col("quality_flag"),
+                col("processing_timestamp"),
+                col("processing_date"),  # from Job A
+                gold_load_ts_col.alias("gold_load_timestamp"),
+                gold_load_date_col.alias("gold_load_date")
+            )
+            .dropDuplicates(["user_id"])  # safer than distinct() for performance/intent
+        )
+
+        logger.info(f"Gold users prepared: {user_gold_df.count()} records")
+
+        # --------------------------------------------------------------------
+        # 4) Company aggregation
+        # Partition by gold_load_date
+        # --------------------------------------------------------------------
+        company_agg_df = (
+            silver_df.groupBy("company_name")
+            .agg(
+                count("user_id").alias("user_count"),
+                countDistinct("city").alias("city_count"),
+                avg("latitude").alias("avg_latitude"),
+                avg("longitude").alias("avg_longitude"),
+                spark_sum(when(col("quality_flag") == "PASS", 1).otherwise(0)).alias("quality_pass_count")
+            )
+            .withColumn("gold_load_timestamp", gold_load_ts_col)
+            .withColumn("gold_load_date", gold_load_date_col)
+        )
+
+        logger.info(f"Company aggregation prepared: {company_agg_df.count()} rows")
+
+        # --------------------------------------------------------------------
+        # 5) Geographic aggregation
+        # Partition by gold_load_date
+        # --------------------------------------------------------------------
+        geo_agg_df = (
+            silver_df.groupBy("city")
+            .agg(
+                count("user_id").alias("user_count"),
+                countDistinct("company_name").alias("company_count"),
+                avg("latitude").alias("avg_latitude"),
+                avg("longitude").alias("avg_longitude")
+            )
+            .withColumn("gold_load_timestamp", gold_load_ts_col)
+            .withColumn("gold_load_date", gold_load_date_col)
+        )
+
+        logger.info(f"Geographic aggregation prepared: {geo_agg_df.count()} rows")
+
+        # --------------------------------------------------------------------
+        # 6) Quality metrics (single small table)
+        # Partition by metric_date (= gold_load_date)
+        # --------------------------------------------------------------------
+        total_records = silver_count
+        pass_count = silver_df.filter(col("quality_flag") == "PASS").count()
+        fail_count = silver_df.filter(col("quality_flag") == "FAIL").count()
+        unique_companies = silver_df.select("company_name").distinct().count()
+        unique_cities = silver_df.select("city").distinct().count()
+
+        quality_metrics_df = spark.createDataFrame([
+            {"metric_name": "total_records",       "metric_value": total_records},
+            {"metric_name": "quality_pass_count",  "metric_value": pass_count},
+            {"metric_name": "quality_fail_count",  "metric_value": fail_count},
+            {"metric_name": "unique_companies",    "metric_value": unique_companies},
+            {"metric_name": "unique_cities",       "metric_value": unique_cities},
+        ]).withColumn("metric_timestamp", gold_load_ts_col) \
+          .withColumn("metric_date", gold_load_date_col)
+
+        logger.info("Quality metrics prepared")
+
+        # --------------------------------------------------------------------
+        # 7) Write outputs to S3 Gold (Parquet)
+        # --------------------------------------------------------------------
+        def write_parquet(df, path, partition_keys):
+            dyf = DynamicFrame.fromDF(df, glueContext, f"dyf_{path.replace('/', '_')}")
+            glueContext.write_dynamic_frame.from_options(
+                frame=dyf,
+                connection_type="s3",
+                format="parquet",
+                connection_options={
+                    "path": path,
+                    "partitionKeys": partition_keys
+                }
+            )
+
+        # Gold users: partition by processing_date (from Silver)
+        write_parquet(
+            user_gold_df,
+            f"{gold_path}users/",
+            ["processing_date"]
+        )
+        logger.info("Wrote gold users")
+
+        # Aggregations: partition by gold_load_date
+        write_parquet(
+            company_agg_df,
+            f"{gold_path}company_aggregation/",
+            ["gold_load_date"]
+        )
+        logger.info("Wrote company aggregation")
+
+        write_parquet(
+            geo_agg_df,
+            f"{gold_path}geographic_aggregation/",
+            ["gold_load_date"]
+        )
+        logger.info("Wrote geographic aggregation")
+
+        # Quality metrics: partition by metric_date
+        write_parquet(
+            quality_metrics_df,
+            f"{gold_path}quality_metrics/",
+            ["metric_date"]
+        )
+        logger.info("Wrote quality metrics")
+
+        # --------------------------------------------------------------------
+        # 8) Metrics
+        # --------------------------------------------------------------------
+        metrics = {
+            "silver_records": silver_count,
+            "gold_users_records": user_gold_df.count(),
+            "company_aggregations": company_agg_df.count(),
+            "geographic_aggregations": geo_agg_df.count(),
+            "quality_metrics_rows": quality_metrics_df.count(),
+            "timestamp": datetime.now().isoformat()
+        }
+
+        logger.info(f"Job B Metrics: {json.dumps(metrics)}")
+        return metrics
+
+    except Exception as e:
+        logger.error(f"Error in Glue Job B: {str(e)}")
+        raise
+
+# ----------------------------------------------------------------------------
+# Run job
+# ----------------------------------------------------------------------------
+glue_job_silver_to_gold()
+job.commit()
