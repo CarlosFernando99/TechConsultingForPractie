@@ -1,0 +1,261 @@
+{
+  "Comment": "Data Pipeline Orchestration - Medallion Architecture Carlos pipeline",
+  "StartAt": "CheckIncrementalLoad",
+  "States": {
+    "CheckIncrementalLoad": {
+      "Type": "Task",
+      "Resource": "arn:aws:lambda:ap-south-1:430006376054:function:incremental-tracking-lambda-1811",
+      "ResultPath": "$.load_info",
+      "Next": "InvokeProducerLambda",
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "ResultPath": "$.error_info",
+          "Next": "HandleError"
+        }
+      ]
+    },
+    "InvokeProducerLambda": {
+      "Type": "Task",
+      "Resource": "arn:aws:lambda:ap-south-1:430006376054:function:producer-lambda-1811",
+      "ResultPath": "$.producer_result",
+      "Next": "WaitForKinesisSettle",
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "ResultPath": "$.error_info",
+          "Next": "HandleError"
+        }
+      ]
+    },
+    "WaitForKinesisSettle": {
+      "Type": "Wait",
+      "Seconds": 30,
+      "Comment": "Wait for Consumer Lambda to write Bronze to S3",
+      "Next": "StartBronzeCrawler"
+    },
+    "StartBronzeCrawler": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::aws-sdk:glue:startCrawler",
+      "Parameters": {
+        "Name": "bronze-crawler-1811"
+      },
+      "Next": "WaitCrawler",
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "ResultPath": "$.error_info",
+          "Next": "HandleError"
+        }
+      ]
+    },
+    "WaitCrawler": {
+      "Type": "Wait",
+      "Seconds": 20,
+      "Next": "GetCrawlerStatus"
+    },
+    "GetCrawlerStatus": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::aws-sdk:glue:getCrawler",
+      "Parameters": {
+        "Name": "bronze-crawler-1811"
+      },
+      "ResultPath": "$.crawler",
+      "Next": "CrawlerDone?",
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "ResultPath": "$.error_info",
+          "Next": "HandleError"
+        }
+      ]
+    },
+    "CrawlerDone?": {
+      "Type": "Choice",
+      "Choices": [
+        {
+          "Variable": "$.crawler.Crawler.State",
+          "StringEquals": "READY",
+          "Next": "StartGlueJobBronzeToSilver"
+        }
+      ],
+      "Default": "WaitCrawler"
+    },
+    "StartGlueJobBronzeToSilver": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::aws-sdk:glue:startJobRun",
+      "Parameters": {
+        "JobName": "bronze-to-silver1811"
+      },
+      "ResultPath": "$.jobA",
+      "Next": "WaitJobA",
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "ResultPath": "$.error_info",
+          "Next": "HandleError"
+        }
+      ]
+    },
+    "WaitJobA": {
+      "Type": "Wait",
+      "Seconds": 30,
+      "Next": "GetJobAStatus"
+    },
+    "GetJobAStatus": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::aws-sdk:glue:getJobRun",
+      "Parameters": {
+        "JobName": "bronze-to-silver1811",
+        "RunId.$": "$.jobA.JobRunId"
+      },
+      "ResultPath": "$.jobAStatus",
+      "Next": "JobADone?",
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "ResultPath": "$.error_info",
+          "Next": "HandleError"
+        }
+      ]
+    },
+    "JobADone?": {
+      "Type": "Choice",
+      "Choices": [
+        {
+          "Variable": "$.jobAStatus.JobRun.JobRunState",
+          "StringEquals": "SUCCEEDED",
+          "Next": "StartGlueJobSilverToGold"
+        },
+        {
+          "Or": [
+            {
+              "Variable": "$.jobAStatus.JobRun.JobRunState",
+              "StringEquals": "FAILED"
+            },
+            {
+              "Variable": "$.jobAStatus.JobRun.JobRunState",
+              "StringEquals": "TIMEOUT"
+            },
+            {
+              "Variable": "$.jobAStatus.JobRun.JobRunState",
+              "StringEquals": "STOPPED"
+            }
+          ],
+          "Next": "HandleJobAFailed"
+        }
+      ],
+      "Default": "WaitJobA"
+    },
+    "HandleJobAFailed": {
+      "Type": "Fail",
+      "Error": "GlueJobAFailed",
+      "Cause": "Bronze to Silver Glue job failed"
+    },
+    "StartGlueJobSilverToGold": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::aws-sdk:glue:startJobRun",
+      "Parameters": {
+        "JobName": "silver-to-gold-1811"
+      },
+      "ResultPath": "$.jobB",
+      "Next": "WaitJobB",
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "ResultPath": "$.error_info",
+          "Next": "HandleError"
+        }
+      ]
+    },
+    "WaitJobB": {
+      "Type": "Wait",
+      "Seconds": 30,
+      "Next": "GetJobBStatus"
+    },
+    "GetJobBStatus": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::aws-sdk:glue:getJobRun",
+      "Parameters": {
+        "JobName": "silver-to-gold-1811",
+        "RunId.$": "$.jobB.JobRunId"
+      },
+      "ResultPath": "$.jobBStatus",
+      "Next": "JobBDone?",
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "ResultPath": "$.error_info",
+          "Next": "HandleError"
+        }
+      ]
+    },
+    "JobBDone?": {
+      "Type": "Choice",
+      "Choices": [
+        {
+          "Variable": "$.jobBStatus.JobRun.JobRunState",
+          "StringEquals": "SUCCEEDED",
+          "Next": "PipelineSuccess"
+        },
+        {
+          "Or": [
+            {
+              "Variable": "$.jobBStatus.JobRun.JobRunState",
+              "StringEquals": "FAILED"
+            },
+            {
+              "Variable": "$.jobBStatus.JobRun.JobRunState",
+              "StringEquals": "TIMEOUT"
+            },
+            {
+              "Variable": "$.jobBStatus.JobRun.JobRunState",
+              "StringEquals": "STOPPED"
+            }
+          ],
+          "Next": "HandleJobBFailed"
+        }
+      ],
+      "Default": "WaitJobB"
+    },
+    "HandleJobBFailed": {
+      "Type": "Fail",
+      "Error": "GlueJobBFailed",
+      "Cause": "Silver to Gold Glue job failed"
+    },
+    "PipelineSuccess": {
+      "Type": "Succeed",
+      "Comment": "Pipeline execution completed successfully"
+    },
+    "HandleError": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::sqs:sendMessage",
+      "Parameters": {
+        "QueueUrl": "https://sqs.ap-south-1.amazonaws.com/430006376054/data-pipeline-dlq",
+        "MessageBody.$": "States.JsonToString($.error_info)"
+      },
+      "Next": "PipelineFailed"
+    },
+    "PipelineFailed": {
+      "Type": "Fail",
+      "Error": "PipelineExecutionFailed",
+      "Cause": "An error occurred during pipeline execution"
+    }
+  }
+}
